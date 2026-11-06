@@ -27,6 +27,7 @@ PORT = int(os.getenv('LINGAP_PORT', '8000'))
 ADMIN_USER = os.getenv('LINGAP_ADMIN_USER', 'admin')
 ADMIN_PASS = os.getenv('LINGAP_ADMIN_PASSWORD', 'ChangeMe123!')
 SESSIONS = {}
+CLIENT_SESSIONS = {}
 LOCK = threading.Lock()
 ALLOWED_STATUSES = ['Received', 'For screening', 'Needs information', 'For appointment', 'For lawyer review', 'Accepted', 'Declined', 'Closed']
 LAWYERS = [
@@ -47,6 +48,9 @@ def conn():
 def init_db():
  with conn() as db:
   db.executescript('''
+  CREATE TABLE IF NOT EXISTS clients (
+   id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+   salt TEXT NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS matters (
    id INTEGER PRIMARY KEY AUTOINCREMENT, reference TEXT UNIQUE NOT NULL,
    name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT, city TEXT,
@@ -69,6 +73,8 @@ def init_db():
    id INTEGER PRIMARY KEY AUTOINCREMENT, matter_id INTEGER NOT NULL REFERENCES matters(id),
    label TEXT NOT NULL, created_at TEXT NOT NULL);
   ''')
+  cols={r[1] for r in db.execute('PRAGMA table_info(matters)')}
+  if 'client_id' not in cols: db.execute('ALTER TABLE matters ADD COLUMN client_id INTEGER REFERENCES clients(id)')
   if db.execute('SELECT COUNT(*) FROM matters').fetchone()[0] == 0:
    samples = [
     ('Alex Reyes','alex.demo@example.test','Family Law / VAWC','For screening','High','Atty. Maria L. Dela Peña'),
@@ -106,6 +112,19 @@ def admin_ok(h):
  except cookies.CookieError: return False
  token=c['lingap_session'].value if 'lingap_session' in c else ''
  return bool(token and token in SESSIONS)
+
+def client_id(h):
+ c=cookies.SimpleCookie()
+ try:c.load(h.headers.get('Cookie',''))
+ except cookies.CookieError:return None
+ token=c['lingap_client'].value if 'lingap_client' in c else ''
+ return CLIENT_SESSIONS.get(token)
+
+def password_hash(password,salt):
+ return hashlib.pbkdf2_hmac('sha256',password.encode('utf-8'),bytes.fromhex(salt),260000).hex()
+
+def client_cookie(token,max_age=28800):
+ return f'lingap_client={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}'
 
 class App(BaseHTTPRequestHandler):
  server_version='LINGAPDemo/1.0'
@@ -159,6 +178,24 @@ class App(BaseHTTPRequestHandler):
     appointment=db.execute('SELECT date,time,type FROM appointments WHERE matter_id=?',(r['id'],)).fetchone()
     events=db.execute('SELECT label,created_at FROM events WHERE matter_id=? ORDER BY id DESC',(r['id'],)).fetchall()
    return self.reply({'matter':dict(r),'appointment':dict(appointment) if appointment else None,'events':[dict(x) for x in events]})
+  if path=='/api/client/me':
+   cid=client_id(self)
+   if not cid:return self.reply({'authenticated':False})
+   with conn() as db:
+    r=db.execute('SELECT id,name,email FROM clients WHERE id=?',(cid,)).fetchone()
+   return self.reply({'authenticated':bool(r),'client':dict(r) if r else None})
+  if path=='/api/client/matters':
+   cid=client_id(self)
+   if not cid:return self.fail('Please sign in.',401)
+   with conn() as db:
+    rows=db.execute("""SELECT id,reference,category,screening,status,assigned_to,created_at,updated_at
+     FROM matters WHERE client_id=? ORDER BY created_at DESC""",(cid,)).fetchall()
+    results=[]
+    for r in rows:
+     a=db.execute('SELECT date,time,type FROM appointments WHERE matter_id=?',(r['id'],)).fetchone()
+     events=db.execute('SELECT label,created_at FROM events WHERE matter_id=? ORDER BY id DESC',(r['id'],)).fetchall()
+     results.append({'matter':dict(r),'appointment':dict(a) if a else None,'events':[dict(e) for e in events]})
+   return self.reply({'matters':results})
   if path=='/api/admin/me':return self.reply({'authenticated':admin_ok(self)})
   if path.startswith('/api/admin/'):
    if not self.require_admin(): return
@@ -187,6 +224,30 @@ class App(BaseHTTPRequestHandler):
   except (ValueError,json.JSONDecodeError) as e:self.fail(str(e))
   except Exception as e:print('POST error:',repr(e));self.fail('Unexpected server error.',500)
  def post(self,path,b):
+  if path=='/api/client/register':
+   name=clean(b.get('name'),120);email=clean(b.get('email'),200).lower();password=str(b.get('password',''))
+   if len(name)<2 or not is_email(email):return self.fail('Enter a name and valid email.')
+   if len(password)<10 or len(password)>128:return self.fail('Password must be 10–128 characters.')
+   salt=secrets.token_hex(16);digest=password_hash(password,salt)
+   with conn() as db:
+    try:
+     cur=db.execute('INSERT INTO clients(name,email,salt,password_hash,created_at) VALUES(?,?,?,?,?)',(name,email,salt,digest,now()))
+     db.commit()
+    except sqlite3.IntegrityError:return self.fail('An account with this email already exists.',409)
+   token=secrets.token_urlsafe(32);CLIENT_SESSIONS[token]=cur.lastrowid
+   return self.reply({'ok':True,'client':{'name':name,'email':email}},201,{'Set-Cookie':client_cookie(token)})
+  if path=='/api/client/login':
+   email=clean(b.get('email'),200).lower();password=str(b.get('password',''))
+   with conn() as db:r=db.execute('SELECT * FROM clients WHERE email=?',(email,)).fetchone()
+   if not r or not hmac.compare_digest(password_hash(password,r['salt']),r['password_hash']):return self.fail('Incorrect email or password.',401)
+   token=secrets.token_urlsafe(32);CLIENT_SESSIONS[token]=r['id']
+   return self.reply({'ok':True,'client':{'name':r['name'],'email':r['email']}},extras={'Set-Cookie':client_cookie(token)})
+  if path=='/api/client/logout':
+   c=cookies.SimpleCookie()
+   try:c.load(self.headers.get('Cookie',''))
+   except cookies.CookieError:pass
+   if 'lingap_client' in c:CLIENT_SESSIONS.pop(c['lingap_client'].value,None)
+   return self.reply({'ok':True},extras={'Set-Cookie':client_cookie('',0)})
   if path=='/api/admin/login':
    user=clean(b.get('username'));pw=str(b.get('password',''))
    if not (hmac.compare_digest(user,ADMIN_USER) and hmac.compare_digest(pw,ADMIN_PASS)):
@@ -198,9 +259,13 @@ class App(BaseHTTPRequestHandler):
    if 'lingap_session' in c: SESSIONS.pop(c['lingap_session'].value,None)
    return self.reply({'ok':True},extras={'Set-Cookie':'lingap_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'})
   if path=='/api/intakes':
+   cid=client_id(self)
    if b.get('consent') is not True: return self.fail('Consent is required.')
    name=clean(b.get('name'),120);email=clean(b.get('email'),200).lower()
    if len(name)<2 or not is_email(email):return self.fail('Name and valid email are required.')
+   if cid:
+    with conn() as db: registered_email=db.execute('SELECT email FROM clients WHERE id=?',(cid,)).fetchone()['email']
+    if email!=registered_email:return self.fail('Use your account email for a linked application.')
    income=b.get('monthly_income');size=b.get('household_size')
    try: income=float(income) if income not in (None,'') else None;size=int(size) if size not in (None,'') else None
    except (ValueError,TypeError):return self.fail('Check your household information.')
@@ -215,6 +280,7 @@ class App(BaseHTTPRequestHandler):
      cur=db.execute('''INSERT INTO matters(reference,name,email,phone,city,language,assistance,household_size,monthly_income,category,summary,screening,consent_at,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
       (ref,name,email,clean(b.get('phone'),30),clean(b.get('city'),100),clean(b.get('language'),2),assistance,size,income,category,clean(b.get('summary'),500),screening,stamp,stamp,stamp))
+     if cid: db.execute('UPDATE matters SET client_id=? WHERE id=?',(cid,cur.lastrowid))
      db.execute('INSERT INTO events(matter_id,label,created_at) VALUES(?,?,?)',(cur.lastrowid,'Application received',stamp))
      send_notice(db,email,'applicant','Application received — '+ref,'Your LINGAP intake has been received. This is a demonstration notification; no email was sent.')
      db.commit()

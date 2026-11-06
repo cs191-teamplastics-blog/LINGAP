@@ -108,3 +108,24 @@ Stop the server. Delete `data/lingap.sqlite3` to reset the database. Delete file
 Do not put this server online as-is. For a real service: validate actual OLA questionnaire and skip logic with lawyers; perform DPIA and threat modeling; replace demo identities with verified OLA staff roles; move to a hardened web framework and PostgreSQL; use a private object store with key management, malware scanning, access controls and encrypted document storage; implement an audit log, rate limiting, session expiry, CSRF protections, file retrieval permissions, notifications via approved email provider, retention/deletion automation, offline kiosk workflow, backups and incident response; complete accessibility and security testing; and deploy behind TLS with UP IT approval.
 
 More detail is in `docs/`.
+
+
+## NEW: Client accounts and branded client dashboard
+
+The interface now uses the supplied LINGAP visual direction: Roboto typography, dark maroon `#170000`, maroon `#76090C`, deep green `#0A4424`, gold `#FFBD3A`, light gray `#EDF2F4`, and gray-blue `#8D99AE`. The logo is a locally drawn placeholder wordmark/icon, not an official reproduction of the UP seals. Replace with institution-approved original SVG/PNG files before publication.
+
+### Try the client workflow
+1. Run `python3 server.py` (macOS) or `py server.py` (Windows).
+2. Open `http://127.0.0.1:8000/#/login` and click **Create account**.
+3. Register with a **fictional email and unique demo password** (10+ characters). The account is stored in `data/lingap.sqlite3` and the password is PBKDF2-hashed, not plaintext.
+4. Visit **Pre-screening**, use the same account email, complete the sample intake, and submit.
+5. Visit **My cases** (`/#/dashboard`). Your linked application appears with status, timeline and appointment information.
+6. Log into the separate staff portal (`/#/admin`) and change the sample matter status. Return to the client dashboard and refresh to see the update.
+
+**Existing anonymous/seed records:** historical anonymous cases and the built-in synthetic samples are deliberately **not** linked to newly created client accounts just because the email matches. This avoids unsafe account takeover without verifying email ownership. The old reference + email tracking page remains available for unlinked demo applications, but it is not secure enough for production use.
+
+**Security limitations:** Client sessions are in-memory (restarting the server signs users out); no email verification, account recovery, CSRF protection, request throttling, MFA, hardened cookie HTTPS setting, true data encryption-at-rest, or real email notifications. The local-demo authentication is NOT production-ready. Never use genuine client records. Before real launch, use verified identity, production-grade session management, HTTPS, vetted authorization and a DPIA/security review.
+
+## Troubleshooting: registration seems stuck on /#/dashboard
+
+Version 2 fixes a route refresh bug: the login screen could remain displayed when successful registration tried to navigate to the same `#/dashboard` hash. The app now re-renders the dashboard in that situation. Registration errors also remain visible under the form. If you installed the older version, stop the server with Ctrl+C, replace the project with this ZIP, and run `python3 server.py` again. Existing demo accounts may be kept by copying your `data/lingap.sqlite3` file into the new project's `data/` directory while the server is stopped.
