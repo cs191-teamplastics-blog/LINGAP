@@ -1,0 +1,6 @@
+data/*.sqlite3
+uploads/*
+!uploads/.gitkeep
+__pycache__/
+.env
+.DS_Store
